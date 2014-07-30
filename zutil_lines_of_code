@@ -1,0 +1,867 @@
+*&amp;---------------------------------------------------------------------*
+*&amp; Report  ZSDN_SIMPLE_ABAP_SLOC_COUNT
+*&amp; Author: Andrea Olivieri, Sergio Ferrari
+*&amp;         Techedge SpA
+*&amp; Version: 2.0  - 2009/03/12
+*&amp; Title   How many lines of custom ABAP code are inside your system?
+*&amp;---------------------------------------------------------------------*
+REPORT  zutil_lines_of_code LINE-SIZE 255.
+
+TYPE-POOLS: sedi.
+* Global Data Type [ GDT ;-) ]
+TYPES: BEGIN OF ty_repository,
+         devclass       TYPE tadir-devclass,
+         ctext          TYPE tdevct-ctext,
+         name           TYPE e071-obj_name,
+         object         TYPE tadir-object,
+         text           TYPE trdirt-text,
+         srcsystem      TYPE tadir-srcsystem,
+         author         TYPE tadir-author,
+         subc           TYPE trdir-subc,
+         sloc      TYPE i,
+       END OF ty_repository.
+TYPES: BEGIN OF ty_repository_key,
+         devclass       TYPE tadir-devclass,
+         obj_name       TYPE tadir-obj_name,
+         object         TYPE tadir-object,
+       END OF ty_repository_key.
+TYPES: BEGIN OF devclass_ty,
+        devclass TYPE tdevc-devclass,
+        ctext    TYPE tdevc-ctext,
+      END OF devclass_ty.
+
+TYPES: BEGIN OF ty_irdir,
+          name      LIKE trdir-name,
+          devc      LIKE tadir-devclass,
+          author    LIKE tadir-author,
+          srcsystem LIKE tadir-srcsystem,
+        END OF ty_irdir.
+DATA: l_irdir         TYPE ty_irdir,
+      t_irdir TYPE STANDARD TABLE OF ty_irdir.
+
+
+DATA: l_repository TYPE ty_repository.
+DATA: t_repository TYPE STANDARD TABLE OF ty_repository.
+DATA: t_repository_dynp TYPE STANDARD TABLE OF ty_repository.
+DATA: repository_dynp TYPE ty_repository.
+DATA: t_devclass TYPE SORTED TABLE OF devclass_ty WITH UNIQUE KEY devclass,
+      l_devclass TYPE devclass_ty.
+*--------------------------------------------------------------------*
+* defining the selection-screen
+*--------------------------------------------------------------------*
+TABLES: tadir.
+SELECT-OPTIONS: xpack    FOR tadir-devclass,
+                xobject  FOR tadir-object,
+                xobjname FOR tadir-obj_name,
+                xauthor  FOR tadir-author.
+*--------------------------------------------------------------------*
+* Initialization
+*--------------------------------------------------------------------*
+INITIALIZATION.
+  PERFORM init_selection_texts.
+  PERFORM init_select_options.
+*--------------------------------------------------------------------*
+* Start of Selection
+*--------------------------------------------------------------------*
+START-OF-SELECTION.
+  PERFORM get_obj_set.
+  PERFORM upd_obj_set_count_class_sloc.
+  PERFORM count_prog_sloc.
+  PERFORM provide_missing_text.
+*--------------------------------------------------------------------*
+* End of Selection
+*--------------------------------------------------------------------*
+END-OF-SELECTION.
+  PERFORM alv.
+
+*&amp;---------------------------------------------------------------------*
+*&amp;      Form  init_select_options
+*&amp;---------------------------------------------------------------------*
+*       INCLUDE OBJECTS:  PROG, FUGR, CLAS, TYPE, WAPA
+*       EXCLUDE PACKAGES: $TMP and from A to W
+*       EXCLUDE USERS:    SAP, SAP*, DDIC
+*----------------------------------------------------------------------*
+FORM init_select_options.
+
+* Include objects: PROG, FUGR and CLAS
+  IF xobject[] IS INITIAL.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'PROG'. APPEND xobject.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'FUGR'. APPEND xobject.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'CLAS'. APPEND xobject.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'TYPE'. APPEND xobject.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'WAPA'. APPEND xobject.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'XSLT'. APPEND xobject.
+    xobject-sign   = 'I'. xobject-option = 'EQ'. xobject-low = 'WDYN'. APPEND xobject.
+  ENDIF.
+
+* Exclude packages: $TMP and from A to W
+  IF xpack[] IS INITIAL.
+    xpack-sign   = 'E'. xpack-option = 'BT'. xpack-low = 'A'. xpack-high = 'WZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ'. APPEND xpack.
+    xpack-sign   = 'E'. xpack-option = 'EQ'. xpack-low = '$TMP'. APPEND xpack.
+  ENDIF.
+
+* Exclude objects belonging to users: SAP* and DDIC
+  IF xauthor[] IS INITIAL.
+    xauthor-sign   = 'E'. xauthor-option = 'EQ'.     xauthor-low =   'SAP'.  APPEND xauthor.
+    xauthor-sign   = 'E'. xauthor-option = 'EQ'.     xauthor-low =   'SAP*'. APPEND xauthor.
+    xauthor-sign   = 'E'. xauthor-option = 'EQ'.     xauthor-low =   'DDIC'. APPEND xauthor.
+  ENDIF.
+ENDFORM.                    "init_select_options
+
+*&---------------------------------------------------------------------*
+*&      Form  get_obj_set
+*&---------------------------------------------------------------------*
+*       Get from TADIR
+*----------------------------------------------------------------------*
+FORM get_obj_set.
+  DATA: l_tadir TYPE tadir.
+
+  SELECT * FROM tadir INTO l_tadir
+           WHERE pgmid      EQ 'R3TR'
+           AND   obj_name   IN xobjname
+           AND   object     IN xobject
+           AND   devclass   IN xpack
+           AND   srcsystem  NE 'SAP'
+           AND   author     IN xauthor.               "#EC CI_SGLSELECT
+    IF NOT l_tadir-obj_name CP '_______________________________*'.
+      MOVE-CORRESPONDING l_tadir TO l_repository.
+      l_repository-name     = l_tadir-obj_name.
+      APPEND l_repository TO t_repository.
+    ENDIF.
+  ENDSELECT.
+
+  SORT t_repository BY devclass name.
+
+ENDFORM.                    "get_obj_set
+
+*&---------------------------------------------------------------------*
+*&      Form  upd_obj_set_count_class_sloc
+*&---------------------------------------------------------------------*
+*       ...and Compute SLOC for CLAS
+*----------------------------------------------------------------------*
+FORM upd_obj_set_count_class_sloc.
+  TYPES:
+        BEGIN OF ty_itab,
+          repname   LIKE sy-repid,
+          devc      LIKE tadir-devclass,
+          author    LIKE tadir-author,
+          srcsystem LIKE tadir-srcsystem,
+        END OF ty_itab.
+
+  DATA: l_itab          TYPE ty_itab,
+        l_itab1         TYPE ty_itab.
+  DATA: t_itab  TYPE STANDARD TABLE OF ty_itab,
+        t_itab1 TYPE STANDARD TABLE OF ty_itab.
+  DATA: save_tabix      TYPE sy-tabix.
+*--------------------------------------------------------------------*
+
+  LOOP AT t_repository INTO l_repository.
+    save_tabix = sy-tabix.
+    CASE l_repository-object.
+      WHEN 'PROG'.
+*-----  Report, Module Pool, Includes
+        PERFORM get_prog_info TABLES t_repository
+                              USING  l_repository save_tabix.
+
+        IF l_repository-subc CA '1M'.
+          PERFORM add_dynpro_info  TABLES t_repository_dynp
+                                   USING  l_repository.
+        ENDIF.
+      WHEN 'FUGR'.
+*-----  Function Group
+        PERFORM get_fgroup_info TABLES t_repository
+                                USING  l_repository save_tabix.
+        PERFORM add_dynpro_info  TABLES t_repository_dynp
+                                 USING  l_repository.
+
+      WHEN 'CLAS'.
+*-----  Class
+        PERFORM get_class_info TABLES t_repository
+                               USING  l_repository save_tabix.
+
+
+      WHEN 'TYPE'.
+*-----  Type Groups
+        PERFORM get_tygr_info TABLES t_repository
+                              USING  l_repository save_tabix.
+
+      WHEN 'WAPA'.
+*-----  BSP Application
+        PERFORM get_bsp_info  TABLES t_repository
+                              USING  l_repository save_tabix.
+
+      WHEN 'XSLT'.
+*-----  XSLT Transformation
+        PERFORM get_xslt_info TABLES t_repository
+                              USING  l_repository save_tabix.
+
+      WHEN 'WDYN'.
+*-----  WebDynpro
+        PERFORM get_wdyn_ifno TABLES t_repository
+                              USING  l_repository save_tabix.
+
+      WHEN OTHERS. CONTINUE.
+    ENDCASE.
+
+  ENDLOOP.
+
+  IF t_irdir[] IS NOT INITIAL.
+    LOOP AT t_irdir INTO l_irdir.
+      REFRESH t_itab1.
+      CALL FUNCTION 'GET_INCLUDES'
+        EXPORTING
+          progname = l_irdir-name
+        TABLES
+          incltab  = t_itab1.
+
+*     append lines of t_itab1 to itab.
+      LOOP AT t_itab1 INTO l_itab1.
+        l_itab-repname   = l_itab1-repname.
+        l_itab-devc      = l_irdir-devc.
+        l_itab-author    = l_irdir-author.
+        l_itab-srcsystem = l_irdir-srcsystem.
+        APPEND l_itab TO t_itab.
+        CLEAR l_itab.
+      ENDLOOP.
+    ENDLOOP.
+  ENDIF.
+
+  DATA: l_trdir TYPE trdir.
+
+  CLEAR: l_repository.
+  LOOP AT t_itab INTO l_itab.
+    SELECT SINGLE * FROM  trdir INTO l_trdir
+           WHERE  name  = l_itab-repname
+            AND    cnam  NOT LIKE 'SAP%'
+            AND    cnam  <> 'DDIC'.
+    CHECK sy-subrc = 0.
+
+    MOVE-CORRESPONDING l_trdir TO l_repository.
+    l_repository-devclass  = l_itab-devc.
+    l_repository-author    = l_itab-author.
+    l_repository-srcsystem = l_itab-srcsystem.
+    l_repository-object    = 'PROG'.
+    APPEND l_repository TO t_repository.
+
+  ENDLOOP.
+
+  IF NOT t_repository_dynp IS INITIAL.
+    APPEND LINES OF t_repository_dynp TO t_repository.
+  ENDIF.
+
+
+  SORT t_repository BY name object devclass.
+  DELETE ADJACENT DUPLICATES FROM t_repository COMPARING name object devclass.
+
+ENDFORM.                    "upd_obj_set_count_class_sloc
+*&amp;---------------------------------------------------------------------*
+*&amp;      Form  count_prog_sloc
+*&amp;---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM count_prog_sloc.
+  DATA: l_prog     TYPE c LENGTH 30.
+  DATA: isource    TYPE TABLE OF string.
+  DATA: l_1st_char TYPE c.
+
+  LOOP AT t_repository INTO l_repository WHERE object = 'PROG' OR object = 'TYPE'.
+*   Compute SLOC !
+    l_prog = l_repository-name.
+    READ REPORT l_prog INTO isource.
+    DATA: l_source_line TYPE string.
+    LOOP AT isource INTO l_source_line.
+      l_1st_char = l_source_line.
+      IF    l_source_line IS INITIAL     "Empty
+         OR l_1st_char = '*'.            "Comment
+        DELETE isource INDEX sy-tabix.
+      ENDIF.
+    ENDLOOP.
+    l_repository-sloc = lines( isource ).
+
+*   Update SLOC into t_repository
+    READ TABLE t_repository WITH TABLE KEY name  = l_repository-name
+                                       devclass  = l_repository-devclass
+                                       ctext     = l_repository-ctext
+                                       object    = l_repository-object
+                                       text      = l_repository-text
+                                       srcsystem = l_repository-srcsystem
+                                       author    = l_repository-author
+                                       subc      = l_repository-subc
+                        TRANSPORTING NO FIELDS.
+    IF sy-subrc = 0.
+      MODIFY t_repository FROM l_repository INDEX sy-tabix TRANSPORTING sloc.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "count_prog_sloc
+*&---------------------------------------------------------------------*
+*&      Form  PROVIDE_MISSING_TEXT
+*&---------------------------------------------------------------------*
+* Get DEVCs and Programs descriptions
+*----------------------------------------------------------------------*
+FORM provide_missing_text .
+  DATA: save_tabix TYPE sy-tabix,
+        ltdevct    TYPE tdevct,
+        ltlibt     TYPE tlibt,
+*        lfugr      TYPE rs38l-area,
+        lnamespace TYPE rs38l-namespace.
+
+  DATA: ltrdirt TYPE trdirt,
+        ltftit  TYPE tftit,
+        lfuncname TYPE tftit-funcname.
+
+  DATA:  lfgroup TYPE  rs38l-str_area,
+        lprog    TYPE   rs38l-include.
+
+  TYPES: BEGIN OF n_ty,
+           name TYPE progname,
+         END OF n_ty.
+  DATA:  xxkey TYPE SORTED TABLE OF n_ty WITH UNIQUE KEY name,
+         lxkey TYPE n_ty.
+*--------------------------------------------------------------------*
+
+* Get Development Classes
+  LOOP AT t_repository INTO l_repository.
+    l_devclass-devclass = l_repository-devclass.
+    INSERT l_devclass INTO TABLE t_devclass.
+  ENDLOOP.
+* Get DEVC Text
+  LOOP AT t_devclass INTO l_devclass.
+    CLEAR ltdevct.
+    SELECT SINGLE * FROM tdevct INTO ltdevct
+      WHERE devclass = l_devclass-devclass AND spras = sy-langu.
+    IF sy-subrc = 0.
+      l_repository-ctext = ltdevct-ctext.
+      MODIFY t_repository FROM l_repository TRANSPORTING ctext WHERE devclass = l_devclass-devclass.
+    ENDIF.
+  ENDLOOP.
+
+* Get Abap Program Short Text
+  LOOP AT t_repository INTO l_repository.
+    lxkey-name = l_repository-name.
+    INSERT lxkey INTO TABLE xxkey.
+  ENDLOOP.
+
+  SELECT name text FROM trdirt INTO (ltrdirt-name,ltrdirt-text)
+                FOR ALL ENTRIES IN xxkey
+                WHERE name  EQ xxkey-name
+                AND   sprsl EQ sy-langu.
+    READ TABLE t_repository INTO l_repository WITH KEY name = ltrdirt-name.
+    CHECK sy-subrc EQ 0.
+    l_repository-text = ltrdirt-text.
+    MODIFY t_repository FROM l_repository INDEX sy-tabix TRANSPORTING text.
+  ENDSELECT.
+
+
+* Get Function Group and Function Module Short Text
+  LOOP AT t_repository INTO l_repository WHERE  text EQ space AND
+       ( name CS 'SAPL'  ) OR  ( name(1) EQ 'L' AND name CS 'U' ).
+
+    save_tabix = sy-tabix.
+    CLEAR: lprog, lnamespace, lfgroup, ltlibt, ltftit .
+
+    lprog = l_repository-name.
+
+    IF l_repository-name CS 'SAPL'.
+      CALL FUNCTION 'FUNCTION_INCLUDE_SPLIT'
+        EXPORTING
+          program   = lprog
+        IMPORTING
+          namespace = lnamespace
+          group     = lfgroup
+        EXCEPTIONS
+          OTHERS    = 1.
+
+
+      IF lfgroup  NE space AND sy-subrc EQ 0.
+        CONCATENATE lnamespace lfgroup INTO lfgroup.
+*       Function Group Text
+        SELECT SINGLE * FROM tlibt INTO ltlibt WHERE spras = sy-langu
+                                   AND   area  = lfgroup.
+        IF sy-subrc = 0.
+          l_repository-text =  ltlibt-areat.
+          MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING text.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      CLEAR lfuncname.
+      CALL FUNCTION 'FUNCTION_INCLUDE_INFO'
+        CHANGING
+          funcname = lfuncname
+          include  = lprog
+        EXCEPTIONS
+          OTHERS   = 1.
+
+      IF sy-subrc EQ 0 AND lfuncname NE space.
+        SELECT  SINGLE * FROM  tftit INTO ltftit
+               WHERE  spras       = sy-langu
+               AND    funcname    = lfuncname.
+        IF sy-subrc = 0.
+          l_repository-text =  ltftit-stext.
+          MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING text.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " PROVIDE_MISSING_TEXT
+*&amp;---------------------------------------------------------------------*
+*&amp;      Form  ADD_DYNPRO_INFO
+*&amp;---------------------------------------------------------------------*
+*       Add DYNPRO Text and flow locic SLOC
+*----------------------------------------------------------------------*
+FORM add_dynpro_info    TABLES   t_repository_dynp LIKE t_repository_dynp
+                        USING    l_repository TYPE ty_repository.
+
+* Local Data
+  DATA: sourceline      TYPE string.
+  DATA: l_1st_char      TYPE c,
+        l_sloc TYPE i.
+
+  DATA: td020s   TYPE TABLE OF d020s,
+        ld020s   TYPE d020s,
+        flowtab  TYPE TABLE OF d022s ,
+        flowline TYPE d022s,
+        dynp_text TYPE d020t-dtxt.
+*        repository_dynp TYPE ty_repository.
+  DATA:  BEGIN OF dynpro_id,
+             prog LIKE d020s-prog,
+             dnum LIKE d020s-dnum,
+           END   OF dynpro_id.
+*--------------------------------------------------------------------*
+
+  SELECT * FROM d020s INTO TABLE td020s
+    WHERE  type NE 'S'                        "Selection Screen
+    AND    type NE 'J'
+    AND    prog = l_repository-name.
+
+  LOOP AT td020s INTO ld020s.
+    CLEAR repository_dynp.
+    REFRESH: flowtab.
+    CLEAR:   flowline, dynp_text.
+    dynpro_id-prog = ld020s-prog.
+    dynpro_id-dnum = ld020s-dnum.
+
+    CALL FUNCTION 'RPY_DYNPRO_READ_NATIVE'
+      EXPORTING
+        progname         = ld020s-prog
+        dynnr            = ld020s-dnum
+      IMPORTING
+        dynprotext       = dynp_text
+      TABLES
+        flowlogic        = flowtab
+      EXCEPTIONS
+        cancelled        = 1
+        not_found        = 2
+        permission_error = 3
+        OTHERS           = 4.
+    IF sy-subrc = 0.
+      repository_dynp = l_repository.
+      repository_dynp-name   = dynpro_id.
+      repository_dynp-object = 'DYNP'.
+      repository_dynp-text   = dynp_text.
+*           Compute SLOC !
+      LOOP AT flowtab INTO flowline.
+        l_1st_char = flowline.
+        IF    flowline IS INITIAL
+           OR l_1st_char = '*'.
+          DELETE flowtab INDEX sy-tabix.
+        ENDIF.
+      ENDLOOP.
+      l_sloc = lines( flowtab ).
+      repository_dynp-sloc = l_sloc.
+      APPEND repository_dynp TO t_repository_dynp.
+      CLEAR repository_dynp.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " ADD_DYNPRO_INFO
+*&amp;---------------------------------------------------------------------*
+*&amp;      Form  GET_CLASS_INFO
+*&amp;---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_class_info  TABLES   t_repository LIKE t_repository
+                     USING    l_repository TYPE ty_repository
+                              save_tabix   TYPE sy-tabix.
+* Local Data
+  DATA source_new TYPE sedi_source.
+  DATA l_inctype(5).
+
+  TYPES: BEGIN OF ty_crdir,
+           name LIKE trdir-name,
+           subc LIKE trdir-subc,
+           devc LIKE tadir-devclass,
+         END OF ty_crdir.
+
+  DATA: l_class         TYPE sobj_name,
+        l_pgmid         TYPE pgmid,
+        l_object        TYPE trobjtype,
+        class_name      TYPE programm,
+        class_pool_name TYPE programm,
+        lclskey         TYPE seoclskey.
+  DATA: sourceline      TYPE string.
+  DATA: l_1st_char      TYPE c.
+
+  DATA: l_crdir         TYPE ty_crdir.
+  DATA: t_crdir TYPE STANDARD TABLE OF ty_crdir.
+
+  DATA: l_sloc          TYPE i.
+*  DATA   filename TYPE progstruc.
+
+*--------------------------------------------------------------------*
+
+  class_name = l_repository-name.
+  l_pgmid = 'R3TR'.
+  l_object = l_repository-object.
+  l_class = class_name.
+  CALL FUNCTION 'SEO_CLASS_GET_CP_NAME'
+    EXPORTING
+      pgmid                 = l_pgmid
+      object                = l_object
+      obj_name              = l_class
+    IMPORTING
+      progname              = class_pool_name
+    EXCEPTIONS
+      no_class_or_interface = 1.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE subc FROM trdir INTO l_repository-subc WHERE name = class_pool_name.
+    IF sy-subrc = 0.
+      MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING subc.
+    ELSE.
+      DELETE t_repository INDEX save_tabix.
+    ENDIF.
+  ENDIF.
+
+  lclskey-clsname = cl_oo_classname_service=>get_clsname_by_include( class_name ).
+
+  CLEAR l_class.
+  CONCATENATE l_repository-name '%' INTO l_class.
+
+  SELECT name FROM  trdir INTO TABLE t_crdir WHERE  name  LIKE l_class.
+  IF NOT t_crdir[] IS INITIAL.
+    LOOP AT t_crdir INTO l_crdir.
+      l_inctype = l_crdir-name+30(5) .
+      REFRESH source_new.
+*      CALL FUNCTION 'SEO_CLASS_GET_INCLUDE_SOURCE'
+*        EXPORTING
+*          clskey                       = lclskey
+*          inctype                      = l_inctype
+*        IMPORTING
+*          source_expanded              = source_new
+*        EXCEPTIONS
+*          _internal_class_not_existing = 1
+*          not_existing                 = 2
+*          OTHERS                       = 3.
+
+      READ REPORT l_crdir-name INTO source_new.
+      CHECK sy-subrc = 0.
+
+*           Compute SLOC !
+      LOOP AT source_new INTO sourceline.
+        l_1st_char = sourceline.
+        IF    sourceline IS INITIAL
+           OR l_1st_char = '*'.
+          DELETE source_new INDEX sy-tabix.
+        ENDIF.
+      ENDLOOP.
+      l_sloc = lines( source_new ).
+      ADD l_sloc TO l_repository-sloc.
+    ENDLOOP.
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING sloc subc.
+  ENDIF.
+
+ENDFORM.                    " GET_CLASS_INFO
+*&---------------------------------------------------------------------*
+*&      Form  GET_FGROUP_INFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_fgroup_info TABLES   t_repository LIKE t_repository
+                     USING    l_repository TYPE ty_repository
+                              save_tabix   TYPE sy-tabix.
+
+  DATA: lgroup TYPE rs38l-area,
+        lpname TYPE tfdir-pname.
+
+  lgroup = l_repository-name.
+
+  CALL FUNCTION 'FUNCTION_INCLUDE_INFO'
+    IMPORTING
+      pname  = lpname
+    CHANGING
+      group  = lgroup
+    EXCEPTIONS
+      OTHERS = 0.
+
+* Function group doesn't exist
+  IF lpname IS INITIAL.
+    CONCATENATE 'SAPL' lgroup INTO lpname.
+  ENDIF.
+
+  l_irdir-name      = lpname.
+  l_irdir-devc      = l_repository-devclass.
+  l_irdir-srcsystem = l_repository-srcsystem.
+  l_repository-name   = l_irdir-name.
+  l_repository-object = 'PROG'.
+  SELECT SINGLE subc unam FROM trdir INTO (l_repository-subc, l_repository-author) WHERE  name = l_repository-name.
+  IF sy-subrc = 0.
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING name object subc srcsystem author.
+  ELSE.
+    DELETE t_repository INDEX save_tabix.
+*    RETURN.
+  ENDIF.
+
+  l_irdir-author    = l_repository-author.
+
+  APPEND l_irdir TO t_irdir.
+  CLEAR l_irdir.
+
+ENDFORM.                    " GET_FGROUP_INFO
+*&amp;---------------------------------------------------------------------*
+*&amp;      Form  GET_PROG_INFO
+*&amp;---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_prog_info  TABLES   t_repository LIKE t_repository
+                    USING    l_repository TYPE ty_repository
+                             save_tabix   TYPE sy-tabix.
+
+  SELECT SINGLE subc FROM trdir INTO l_repository-subc WHERE  name = l_repository-name.
+  IF sy-subrc = 0.
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING subc .
+  ELSE.
+    DELETE t_repository INDEX save_tabix.
+  ENDIF.
+
+ENDFORM.                    " GET_PROG_INFO
+*&---------------------------------------------------------------------*
+*&      Form  GET_TYGR_INFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_tygr_info  TABLES   t_repository LIKE t_repository
+                    USING    l_repository TYPE ty_repository
+                             save_tabix   TYPE sy-tabix.
+
+  CONSTANTS: inclprefix(3) VALUE '%_C'.     "Type Group
+  DATA:      tygr_name       TYPE programm.
+
+  CONCATENATE inclprefix l_repository-name INTO tygr_name.
+  SELECT SINGLE subc FROM trdir INTO l_repository-subc WHERE  name = tygr_name.
+  IF sy-subrc = 0.
+    SELECT SINGLE ddtext FROM ddtypet INTO l_repository-text
+     WHERE typegroup = l_repository-name
+     AND ddlanguage  = sy-langu.
+
+    l_repository-name   = tygr_name.
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING name subc .
+  ELSE.
+    DELETE t_repository INDEX save_tabix.
+  ENDIF.
+
+ENDFORM.                    " GET_TYGR_INFO
+*&---------------------------------------------------------------------*
+*&      Form  GET_BSP_INFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_bsp_info  TABLES   t_repository LIKE t_repository
+                    USING    l_repository TYPE ty_repository
+                             save_tabix   TYPE sy-tabix.
+
+  DATA: to2pagdir TYPE TABLE OF o2pagdir,
+        lo2pagdir TYPE o2pagdir,
+        l_pagekey TYPE o2pagkey,
+        source_bsp TYPE rswsourcet.
+  DATA: sourceline      TYPE string.
+  DATA: l_1st_char      TYPE c,
+        l_sloc TYPE i.
+
+* Get Pages with logic
+  SELECT * FROM  o2pagdir INTO TABLE to2pagdir
+         WHERE  applname  = l_repository-name
+         AND    pagetype  = space.
+
+  CHECK sy-subrc = 0.
+
+* Get Application Text
+  SELECT SINGLE applext FROM o2appl INTO l_repository-text
+       WHERE  applname  = l_repository-name
+       AND    version   = 'A'.   "Active
+
+  LOOP AT to2pagdir INTO lo2pagdir.
+
+    l_pagekey-applname =  lo2pagdir-applname.
+    l_pagekey-pagekey  =  lo2pagdir-pagekey.
+
+    CALL FUNCTION 'BSP_GET_SOURCE'
+      EXPORTING
+        p_pagekey         = l_pagekey
+      IMPORTING
+        p_source          = source_bsp[]
+      EXCEPTIONS
+        page_not_existing = 0
+        OTHERS            = 0.
+
+    LOOP AT source_bsp INTO sourceline.
+      l_1st_char = sourceline.
+      IF    sourceline IS INITIAL
+         OR l_1st_char = '*'.
+        DELETE source_bsp INDEX sy-tabix.
+      ENDIF.
+    ENDLOOP.
+    l_sloc = lines( source_bsp ).
+    ADD l_sloc TO l_repository-sloc.
+
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING sloc text.
+  ENDLOOP.
+
+ENDFORM.                    " GET_BSP_INFO
+*&---------------------------------------------------------------------*
+*&      Form  INIT_SELECTION_TEXTS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM init_selection_texts .
+
+  %_xpack_%_app_%-text    = 'Package'.
+  %_xobject_%_app_%-text  = 'Object Type'.
+  %_xobjname_%_app_%-text = 'Object Name'.
+  %_xauthor_%_app_%-text  = 'Person Responsible'.
+
+ENDFORM.                    " INIT_SELECTION_TEXTS
+*&amp;---------------------------------------------------------------------*
+*&amp;      Form  ALV
+*&amp;---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv.
+
+  DATA: gr_table     TYPE REF TO cl_salv_table,
+        gr_display   TYPE REF TO cl_salv_display_settings,
+        gr_functions TYPE REF TO cl_salv_functions,
+        gr_sorts     TYPE REF TO cl_salv_sorts,
+        gr_agg       TYPE REF TO cl_salv_aggregations,
+
+      lo_columns   TYPE REF TO cl_salv_columns_table,
+      lo_column    TYPE REF TO cl_salv_column_table.
+
+  TRY.
+*     Create ALV table
+      cl_salv_table=>factory( IMPORTING r_salv_table = gr_table CHANGING t_table = t_repository ).
+*     Set zebra layout
+      gr_display = gr_table->get_display_settings( ).
+      gr_display->set_striped_pattern( cl_salv_display_settings=>true ).
+*     Display all standard function
+      gr_functions = gr_table->get_functions( ).
+      gr_functions->set_all( abap_true ).
+*     Sort
+      gr_sorts = gr_table->get_sorts( ).
+      gr_sorts->add_sort( columnname = 'DEVCLASS' subtotal = abap_true ).
+*     gr_sorts->add_sort( columnname = 'CTEXT'    subtotal = abap_false ).
+      gr_sorts->add_sort( columnname = 'NAME'     subtotal = abap_false ).
+*     Totals
+      gr_agg = gr_table->get_aggregations( ).
+      gr_agg->add_aggregation( 'SLOC' ).
+*     Display table
+      lo_columns = gr_table->get_columns( ).
+      lo_columns->set_optimize( abap_true ).
+      gr_table->display( ).
+    CATCH cx_salv_msg.
+      WRITE: / 'Exception CX_SALV_MSG'.
+    CATCH cx_salv_not_found.
+      WRITE: / 'Exception CX_SALV_NOT_FOUND'.
+    CATCH cx_salv_data_error.
+      WRITE: / 'Exception CX_SALV_DATA_ERROR'.
+    CATCH cx_salv_existing.
+      WRITE: / 'Exception CX_SALV_EXISTING'.
+  ENDTRY.
+
+ENDFORM.                    " ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_XSLT_INFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_T_REPOSITORY  text
+*      -->P_L_REPOSITORY  text
+*      -->P_SAVE_TABIX  text
+*----------------------------------------------------------------------*
+FORM get_xslt_info  TABLES   t_repository LIKE t_repository
+                    USING    l_repository TYPE ty_repository
+                             save_tabix   TYPE sy-tabix.
+
+  DATA source TYPE o2pageline_table.
+  DATA: sourceline      TYPE string.
+  DATA: l_1st_char      TYPE c,
+        l_sloc TYPE i.
+  DATA l_name TYPE cxsltdesc.
+  DATA attr TYPE o2xsltattr.
+
+  l_name = l_repository-name.
+
+  cl_o2_api_xsltdesc=>load(
+    EXPORTING
+      p_xslt_desc                  = l_name
+    IMPORTING
+      p_source                     = source
+      p_attributes                 = attr
+    EXCEPTIONS
+      error_occured                = 1
+      not_existing                 = 2
+      permission_failure           = 3
+      version_not_found            = 4
+         ).
+
+  IF sy-subrc IS INITIAL.
+    LOOP AT source INTO sourceline.
+      l_1st_char = sourceline.
+      IF    sourceline IS INITIAL
+         OR l_1st_char = '*'.
+        DELETE source INDEX sy-tabix.
+      ENDIF.
+    ENDLOOP.
+    l_sloc = lines( source ).
+    ADD l_sloc TO l_repository-sloc.
+    l_repository-text = attr-descript.
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING text sloc.
+  ENDIF.
+
+ENDFORM.                    " GET_XSLT_INFO
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_WDYN_IFNO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_T_REPOSITORY  text
+*      -->P_L_REPOSITORY  text
+*      -->P_SAVE_TABIX  text
+*----------------------------------------------------------------------*
+FORM get_wdyn_ifno  TABLES   t_repository LIKE t_repository
+                    USING    l_repository TYPE ty_repository
+                             save_tabix   TYPE sy-tabix.
+
+  DATA: t_sourceline TYPE TABLE OF string.
+  DATA: t_matches TYPE match_result_tab.
+
+  SELECT SINGLE description
+    FROM wdy_applicationt
+    INTO l_repository-text
+    WHERE application_name = l_repository-name
+    AND langu = sy-langu.
+
+  SELECT code_body
+    FROM wdy_ctlr_compo
+    INTO TABLE t_sourceline
+    WHERE component_name = l_repository-name.
+
+  IF sy-subrc IS INITIAL.
+    FIND ALL OCCURRENCES OF '.' IN TABLE t_sourceline IN CHARACTER MODE RESULTS t_matches.
+    l_repository-sloc = lines( t_matches ).
+    MODIFY t_repository FROM l_repository INDEX save_tabix TRANSPORTING text sloc.
+  ENDIF.
+
+ENDFORM.                    " GET_WDYN_IFNO
